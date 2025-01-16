@@ -1,6 +1,8 @@
 from google.oauth2.service_account import Credentials
 from google.cloud import vision
 from googleapiclient.discovery import build
+from PIL import Image
+import pyheif
 import io
 import logging
 import os
@@ -30,12 +32,35 @@ SOURCE_FOLDER_ID = "1W1T256xpMY1axiBedwTDueitakp7S-19"  # Workフォルダ
 DONE_FOLDER_ID = "1DNpth748BqhecbO_Ehux3aclHusexJFL"    # Doneフォルダ
 DOC_ID = "1j0NgJYwMoaiQ8GlgdaWteM7Bv1JAKnCJQzdkwsamdn0"  # テキストを追記するGoogle DocsのID
 
+# サポートされている画像フォーマット
+SUPPORTED_FORMATS = ["image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp"]
+
+# HEICをPNGに変換
+def convert_to_png(file_data):
+    try:
+        heif_file = pyheif.read(file_data)
+        image = Image.frombytes(
+            heif_file.mode,
+            heif_file.size,
+            heif_file.data,
+            "raw",
+            heif_file.mode,
+            heif_file.stride,
+        )
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        output.seek(0)
+        return output.getvalue()
+    except Exception as e:
+        logger.error(f"Error converting to PNG: {e}")
+        raise
+
 # Google Driveから画像を取得
 def get_image_files_from_drive(folder_id, max_files=10):
     try:
         results = drive_service.files().list(
             q=f"'{folder_id}' in parents and mimeType contains 'image/'",
-            fields="files(id, name)",
+            fields="files(id, name, mimeType)",
             pageSize=max_files
         ).execute()
         files = results.get('files', [])
@@ -46,12 +71,9 @@ def get_image_files_from_drive(folder_id, max_files=10):
         raise
 
 # Vision APIでテキストを抽出
-def extract_text_from_image(file_id):
+def extract_text_from_image(file_data):
     try:
-        request = drive_service.files().get_media(fileId=file_id)
-        file_data = io.BytesIO(request.execute())
-
-        image = vision.Image(content=file_data.getvalue())
+        image = vision.Image(content=file_data)
         response = client.text_detection(image=image)
 
         if response.error.message:
@@ -65,22 +87,66 @@ def extract_text_from_image(file_id):
             logger.info("No text detected.")
             return ""
     except Exception as e:
-        logger.error(f"Error extracting text from image ID {file_id}: {e}")
+        logger.error(f"Error extracting text: {e}")
         raise
 
-# Google Docsにテキストを追記
-def append_text_to_google_doc(doc_id, content):
+# オブジェクト認識
+def detect_objects(file_data):
     try:
+        image = vision.Image(content=file_data)
+        response = client.object_localization(image=image)
+
+        if response.error.message:
+            raise Exception(f"Vision API error: {response.error.message}")
+
+        objects = response.localized_object_annotations
+        logger.info(f"Detected {len(objects)} objects.")
+        return objects
+    except Exception as e:
+        logger.error(f"Error detecting objects: {e}")
+        raise
+
+# Google Docsにオブジェクトの詳細を追記
+def append_objects_to_google_doc(doc_id, objects):
+    try:
+        doc = docs_service.documents().get(documentId=doc_id).execute()
+        body_content = doc.get('body', {}).get('content', [])
+        last_index = body_content[-1]['endIndex'] if body_content else 1
+
+        content = "\nDetected Objects:\n"
+        for obj in objects:
+            content += f"- {obj.name} (Score: {obj.score:.2f})\n"
+
         requests = [
             {"insertText": {
-                "location": {"index": 1},  # ドキュメントの先頭に追記
-                "text": content + "\n"
+                "location": {"index": last_index - 1},
+                "text": content
             }}
         ]
         docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
-        logger.info(f"Appended text to Google Doc ID {doc_id}")
+        logger.info("Appended objects to Google Doc.")
     except Exception as e:
-        logger.error(f"Error appending text to Google Doc ID {doc_id}: {e}")
+        logger.error(f"Error appending objects to Google Doc: {e}")
+        raise
+
+# Google Docsにテキストを追記
+def append_text_to_google_doc(doc_id, text, file_name):
+    try:
+        doc = docs_service.documents().get(documentId=doc_id).execute()
+        body_content = doc.get('body', {}).get('content', [])
+        last_index = body_content[-1]['endIndex'] if body_content else 1
+
+        content = f"\nExtracted Text from {file_name}:\n{text}\n"
+        requests = [
+            {"insertText": {
+                "location": {"index": last_index - 1},
+                "text": content
+            }}
+        ]
+        docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
+        logger.info("Appended text to Google Doc.")
+    except Exception as e:
+        logger.error(f"Error appending text to Google Doc: {e}")
         raise
 
 # Google Driveでファイルを移動
@@ -102,18 +168,31 @@ def move_file_to_folder(file_id, destination_folder_id):
 # 実行
 def main():
     try:
-        # Google Driveから画像を取得（最大10件）
         files = get_image_files_from_drive(SOURCE_FOLDER_ID, max_files=10)
 
         for file in files:
             logger.info(f"Processing file: {file['name']}")
-            # Vision APIでテキストを抽出
-            text = extract_text_from_image(file['id'])
+            request = drive_service.files().get_media(fileId=file['id'])
+            file_data = io.BytesIO(request.execute()).getvalue()
+
+            # フォーマット変換
+            if file['mimeType'] not in SUPPORTED_FORMATS:
+                logger.info(f"Converting unsupported format: {file['mimeType']} to PNG.")
+                file_data = convert_to_png(file_data)
+
+            # オブジェクト認識
+            objects = detect_objects(file_data)
+            if objects:
+                append_objects_to_google_doc(DOC_ID, objects)
+
+            # テキスト認識
+            text = extract_text_from_image(file_data)
             if text:
-                # Google Docsに追記
-                append_text_to_google_doc(DOC_ID, f"{file['name']}:\n{text}")
-                # 処理済みファイルをDoneフォルダに移動
-                move_file_to_folder(file['id'], DONE_FOLDER_ID)
+                append_text_to_google_doc(DOC_ID, text, file['name'])
+
+            # ファイルを移動
+            move_file_to_folder(file['id'], DONE_FOLDER_ID)
+
     except Exception as e:
         logger.error(f"An error occurred during processing: {e}")
 
