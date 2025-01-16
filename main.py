@@ -90,66 +90,26 @@ def extract_text_from_image(file_data):
         logger.error(f"Error extracting text: {e}")
         raise
 
-# オブジェクト認識
-def detect_objects(file_data):
+
+# ファイルのアクセス権限を公開
+def make_file_public(file_id):
     try:
-        image = vision.Image(content=file_data)
-        response = client.object_localization(image=image)
-
-        if response.error.message:
-            raise Exception(f"Vision API error: {response.error.message}")
-
-        objects = response.localized_object_annotations
-        logger.info(f"Detected {len(objects)} objects.")
-        return objects
+        permission = {
+            'type': 'anyone',
+            'role': 'reader'
+        }
+        drive_service.permissions().create(
+            fileId=file_id,
+            body=permission,
+            fields='id'
+        ).execute()
+        file = drive_service.files().get(fileId=file_id, fields='webViewLink').execute()
+        return file['webViewLink']
     except Exception as e:
-        logger.error(f"Error detecting objects: {e}")
+        logger.error(f"Error making file public: {e}")
         raise
 
-# Google Docsにオブジェクトの詳細を追記
-def append_objects_to_google_doc(doc_id, objects):
-    try:
-        doc = docs_service.documents().get(documentId=doc_id).execute()
-        body_content = doc.get('body', {}).get('content', [])
-        last_index = body_content[-1]['endIndex'] if body_content else 1
-
-        content = "\nDetected Objects:\n"
-        for obj in objects:
-            content += f"- {obj.name} (Score: {obj.score:.2f})\n"
-
-        requests = [
-            {"insertText": {
-                "location": {"index": last_index - 1},
-                "text": content
-            }}
-        ]
-        docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
-        logger.info("Appended objects to Google Doc.")
-    except Exception as e:
-        logger.error(f"Error appending objects to Google Doc: {e}")
-        raise
-
-# Google Docsにテキストを追記
-def append_text_to_google_doc(doc_id, text, file_name):
-    try:
-        doc = docs_service.documents().get(documentId=doc_id).execute()
-        body_content = doc.get('body', {}).get('content', [])
-        last_index = body_content[-1]['endIndex'] if body_content else 1
-
-        content = f"\nExtracted Text from {file_name}:\n{text}\n"
-        requests = [
-            {"insertText": {
-                "location": {"index": last_index - 1},
-                "text": content
-            }}
-        ]
-        docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
-        logger.info("Appended text to Google Doc.")
-    except Exception as e:
-        logger.error(f"Error appending text to Google Doc: {e}")
-        raise
-
-# Google Driveでファイルを移動
+# 処理済みファイルをDoneフォルダに移動
 def move_file_to_folder(file_id, destination_folder_id):
     try:
         file = drive_service.files().get(fileId=file_id, fields='parents').execute()
@@ -165,33 +125,71 @@ def move_file_to_folder(file_id, destination_folder_id):
         logger.error(f"Error moving file ID {file_id} to folder ID {destination_folder_id}: {e}")
         raise
 
-# 実行
+# Google Docsにテキストとリンクを正しく追記
+def append_text_and_link_to_google_doc(doc_id, file_name, text, file_url):
+    try:
+        # 現在のドキュメント内容を取得
+        doc = docs_service.documents().get(documentId=doc_id).execute()
+        body_content = doc.get('body', {}).get('content', [])
+        last_index = body_content[-1]['endIndex'] if body_content else 1
+
+        # テキスト挿入リクエスト
+        content = f"\nProcessed File: {file_name}\nExtracted Text:\n{text}\nURL: {file_url}\n"
+        requests = [
+            {"insertText": {
+                "location": {"index": last_index - 1},
+                "text": content
+            }}
+        ]
+        docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
+
+        # リンクスタイルを適用するリクエスト
+        url_start_index = last_index + len(f"\nProcessed File: {file_name}\nExtracted Text:\n{text}\nURL: ")
+        url_end_index = url_start_index + len(file_url)
+        style_requests = [
+            {"updateTextStyle": {
+                "range": {"startIndex": url_start_index, "endIndex": url_end_index},
+                "textStyle": {"link": {"url": file_url}},
+                "fields": "link"
+            }}
+        ]
+        docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": style_requests}).execute()
+
+        logger.info(f"Appended text and activated link for file {file_name}.")
+    except Exception as e:
+        logger.error(f"Error appending text and activating link to Google Doc: {e}")
+        raise
+
+
+# メイン処理
 def main():
     try:
         files = get_image_files_from_drive(SOURCE_FOLDER_ID, max_files=10)
 
         for file in files:
-            logger.info(f"Processing file: {file['name']}")
-            request = drive_service.files().get_media(fileId=file['id'])
-            file_data = io.BytesIO(request.execute()).getvalue()
+            try:
+                logger.info(f"Processing file: {file['name']}")
+                request = drive_service.files().get_media(fileId=file['id'])
+                file_data = io.BytesIO(request.execute()).getvalue()
 
-            # フォーマット変換
-            if file['mimeType'] not in SUPPORTED_FORMATS:
-                logger.info(f"Converting unsupported format: {file['mimeType']} to PNG.")
-                file_data = convert_to_png(file_data)
+                if file['mimeType'] not in SUPPORTED_FORMATS:
+                    logger.info(f"Converting unsupported format: {file['mimeType']} to PNG.")
+                    file_data = convert_to_png(file_data)
 
-            # オブジェクト認識
-            objects = detect_objects(file_data)
-            if objects:
-                append_objects_to_google_doc(DOC_ID, objects)
+                # テキスト抽出
+                text = extract_text_from_image(file_data)
+                if not text:
+                    text = "No text detected."
 
-            # テキスト認識
-            text = extract_text_from_image(file_data)
-            if text:
-                append_text_to_google_doc(DOC_ID, text, file['name'])
+                # ファイルをリンク共有可能に設定
+                move_file_to_folder(file['id'], DONE_FOLDER_ID)
+                public_url = make_file_public(file['id'])
 
-            # ファイルを移動
-            move_file_to_folder(file['id'], DONE_FOLDER_ID)
+                # テキストとURLをGoogle Docsに追記
+                append_text_and_link_to_google_doc(DOC_ID, file['name'], text, public_url)
+
+            except Exception as file_error:
+                logger.error(f"Error processing file {file['name']}: {file_error}")
 
     except Exception as e:
         logger.error(f"An error occurred during processing: {e}")
