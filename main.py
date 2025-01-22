@@ -6,6 +6,7 @@ import pyheif
 import io
 import logging
 import os
+import re
 
 # ログ設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,6 +56,11 @@ def convert_to_png(file_data):
         logger.error(f"Error converting to PNG: {e}")
         raise
 
+# ファイル名から数字を抽出
+def extract_number(file_name):
+    match = re.search(r"\d+", file_name)
+    return int(match.group()) if match else 0  # 数字がない場合は0を返す
+
 # Google Driveから画像を取得
 def get_image_files_from_drive(folder_id, max_files=10):
     try:
@@ -64,7 +70,10 @@ def get_image_files_from_drive(folder_id, max_files=10):
             pageSize=max_files
         ).execute()
         files = results.get('files', [])
-        logger.info(f"Found {len(files)} files in folder ID {folder_id}")
+        files.sort(key=lambda f: extract_number(f['name']))  # 数字順にソート
+        
+        # ソート結果をログ出力
+        logger.info("Sorted files: " + ", ".join(f['name'] for f in files))
         return files
     except Exception as e:
         logger.error(f"Error retrieving files from folder ID {folder_id}: {e}")
@@ -89,7 +98,6 @@ def extract_text_from_image(file_data):
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
         raise
-
 
 # ファイルのアクセス権限を公開
 def make_file_public(file_id):
@@ -159,7 +167,6 @@ def append_text_and_link_to_google_doc(doc_id, file_name, text, file_url):
     except Exception as e:
         logger.error(f"Error appending text and activating link to Google Doc: {e}")
         raise
-
 
 # メイン処理
 def main():
